@@ -3,6 +3,7 @@ import numpy as np
 import random
 import os
 from logic import Board, Pawn, Knight, Bishop, Rook, Queen, King
+from multiprocessing import Pool, cpu_count
 
 # Построение модели
 def build_model():
@@ -15,7 +16,7 @@ def build_model():
         tf.keras.layers.Dense(64, activation='relu'),
         tf.keras.layers.Dense(64, activation='softmax')  # Softmax для предсказания вероятности каждого возможного хода
     ])
-    model.compile(optimizer='adam', loss='categorical_crossentropy')
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     return model
 
 # Получение состояния доски
@@ -34,8 +35,8 @@ def get_board_state(board):
                 state[x, y, idx] = 1
     return state
 
-# Самообучение
-def self_play(model1, model2, num_games=1000):
+# Самообучение для одной пары моделей
+def self_play_for_pair(pair_index, model1, model2, num_games=1000):
     train_X1 = []
     train_y1 = []
     train_X2 = []
@@ -72,33 +73,52 @@ def self_play(model1, model2, num_games=1000):
             # При пате никто не получает очков
             continue
 
-    return np.array(train_X1), np.array(train_y1), np.array(train_X2), np.array(train_y2)
+    return train_X1, train_y1, train_X2, train_y2
 
-# Обучение моделей
-def train_multiple_pairs(num_pairs, num_games_per_pair, epochs=10, batch_size=32):
-    models = [build_model() for _ in range(num_pairs * 2)]
-    os.makedirs('models', exist_ok=True)
-    for i in range(num_pairs):
-        model1 = models[i * 2]
-        model2 = models[i * 2 + 1]
-        train_X1, train_y1, train_X2, train_y2 = self_play(model1, model2, num_games=num_games_per_pair)
+# Обучение одной пары моделей
+def train_pair(pair_index):
+    model1 = build_model()
+    model2 = build_model()
+    train_X1, train_y1, train_X2, train_y2 = self_play_for_pair(pair_index, model1, model2, num_games=10)
 
-        model1.fit(train_X1, train_y1, epochs=epochs, batch_size=batch_size, validation_split=0.2)
-        model2.fit(train_X2, train_y2, epochs=epochs, batch_size=batch_size, validation_split=0.2)
+    model1.fit(np.array(train_X1), np.array(train_y1), epochs=5, batch_size=32, validation_split=0.2)
+    model2.fit(np.array(train_X2), np.array(train_y2), epochs=5, batch_size=32, validation_split=0.2)
 
-        # Сохранение лучшей модели
-        score1 = model1.evaluate(train_X1, train_y1, verbose=0)
-        score2 = model2.evaluate(train_X2, train_y2, verbose=0)
-        winner_model = model1 if score1[1] > score2[1] else model2
+    # Сохранение лучшей модели
+    score1 = model1.evaluate(np.array(train_X1), np.array(train_y1), verbose=0)
+    score2 = model2.evaluate(np.array(train_X2), np.array(train_y2), verbose=0)
+    winner_model = model1 if score1[1] > score2[1] else model2
 
-        model_path = os.path.join("models", f"model_pair_{i}_winner.keras")
-        winner_model.save(model_path)
-        print(f"Сохранена лучшая модель пары {i} в {model_path}")
+    model_path = os.path.join("models", f"model_pair_{pair_index}_winner.keras")
+    winner_model.save(model_path)
+    print(f"Сохранена лучшая модель пары {pair_index} в {model_path}")
 
-        # Загружаем победившую модель для следующей игры
-        winner_model = tf.keras.models.load_model(model_path)
-        models[i * 2] = winner_model
-        models[i * 2 + 1] = build_model()
+# Обучение моделей с использованием нескольких ядер
+def train_multiple_pairs(num_pairs):
+    num_cores = cpu_count() // 2  # Используем половину доступных ядер
+    if num_pairs>num_cores:
+        print('Пар нейросетей больше чем ядер, их количество будет уменьшено')
+        while num_pairs>num_cores:
+            num_pairs=-1        
+    with Pool(processes=num_cores) as pool:
+        pool.map(train_pair, range(num_pairs))
+
+# Определение наилучшей модели среди всех сохраненных
+def find_best_model(models_dir='models'):
+    model_files = [os.path.join(models_dir, f) for f in os.listdir(models_dir) if f.endswith('.keras')]
+    best_model = None
+    best_accuracy = 0
+
+    for model_file in model_files:
+        model = tf.keras.models.load_model(model_file)
+        test_X, test_y = generate_test_data()
+        score = model.evaluate(test_X, test_y, verbose=0)
+        print(f'Model {model_file}: Accuracy - {score[1]}')
+        if score[1] > best_accuracy:
+            best_accuracy = score[1]
+            best_model = model
+
+    return best_model
 
 # Генерация фиктивного тестового набора данных
 def generate_test_data(num_samples=100):
@@ -114,24 +134,8 @@ def generate_test_data(num_samples=100):
         test_y.append(move)
     return np.array(test_X), np.array(test_y)
 
-# Определение наилучшей модели среди всех сохраненных
-def find_best_model(models_dir='models'):
-    model_files = [os.path.join(models_dir, f) for f in os.listdir(models_dir) if f.endswith('.keras')]
-    best_model = None
-    best_accuracy = 0
-
-    for model_file in model_files:
-        model = tf.keras.models.load_model(model_file)
-        test_X, test_y = generate_test_data()
-        score = model.evaluate(test_X, test_y, verbose=0)
-        if score[1] > best_accuracy:
-            best_accuracy = score[1]
-            best_model = model
-
-    return best_model
-
 if __name__ == "__main__":
-    train_multiple_pairs(num_pairs=3, num_games_per_pair=10, epochs=10, batch_size=32)
+    train_multiple_pairs(num_pairs=3)
     best_model = find_best_model()
     os.makedirs('best_models', exist_ok=True)
     if best_model:
